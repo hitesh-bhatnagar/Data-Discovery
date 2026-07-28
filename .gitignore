@@ -1,0 +1,26 @@
+# Python Virtual Environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Generated Reports (contains sensitive PII findings - DO NOT COMMIT)
+reports/*.xlsx
+reports/*.csv
+reports/*.json
+!reports/.gitkeep
+
+# IDE configuration (keep team settings, ignore local state)
+.vscode/*
+!.vscode/settings.json
+.idea/
+
+# OS temporary files
+.DS_Store
+Thumbs.db
