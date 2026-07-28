@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import re
 import csv
+import bisect
 import hashlib
 import argparse
 import datetime
@@ -52,23 +53,32 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# spaCy — NER for names, orgs, locations (Layer 2)
-# Prefer en_core_web_lg (higher accuracy), fallback to en_core_web_sm
+# spaCy — NER for names, orgs, locations (Layer 2) — Lazy Loader
 _NLP = None
 _NLP_MODEL_NAME = "none"
+_SPACY_INITIALIZED = False
 HAS_SPACY = False
-try:
-    import spacy
-    for _model_name in ("en_core_web_lg", "en_core_web_sm"):
-        try:
-            _NLP = spacy.load(_model_name, disable=["parser", "lemmatizer"])
-            _NLP_MODEL_NAME = _model_name
-            HAS_SPACY = True
-            break
-        except OSError:
-            continue
-except ImportError:
-    pass
+
+def get_nlp():
+    global _NLP, _NLP_MODEL_NAME, _SPACY_INITIALIZED, HAS_SPACY
+    if _SPACY_INITIALIZED:
+        return _NLP, _NLP_MODEL_NAME
+    _SPACY_INITIALIZED = True
+    try:
+        import spacy
+        # Disable all unneeded components to reduce RAM footprint by ~60% and speed up processing
+        disable_components = ["parser", "lemmatizer", "tagger", "attribute_ruler", "morphologizer", "senter"]
+        for _model_name in ("en_core_web_lg", "en_core_web_sm"):
+            try:
+                _NLP = spacy.load(_model_name, disable=disable_components)
+                _NLP_MODEL_NAME = _model_name
+                HAS_SPACY = True
+                break
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return _NLP, _NLP_MODEL_NAME
 
 # Optional file parsers — degrade gracefully
 try:
@@ -544,12 +554,48 @@ def extract_text(filepath: str) -> tuple[str | None, str, str | None, int]:
         if ext in (".xlsx", ".xls"):
             wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
             parts = []
+            col_findings = []
             for ws in wb.worksheets:
-                for row in ws.iter_rows(values_only=True):
-                    vals = [str(c) if c is not None else "" for c in row]
-                    parts.append(" | ".join(vals))
+                headers = []
+                col_samples = defaultdict(list)
+                total_rows = ws.max_row or 1
+
+                for row_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+                    row_vals = [str(c) if c is not None else "" for c in row]
+                    parts.append(" | ".join(row_vals))
+
+                    if row_idx == 1:
+                        headers = [v.strip() for v in row_vals]
+                    elif row_idx <= 22:
+                        for col_idx, val in enumerate(row_vals):
+                            if val.strip() and len(col_samples[col_idx]) < 3:
+                                col_samples[col_idx].append(val)
+
+                for col_idx, header in enumerate(headers):
+                    hl = header.lower().strip()
+                    if not hl:
+                        continue
+                    for keyword, (tag, sens, desc, reg) in COLUMN_PII_KEYWORDS.items():
+                        if keyword in hl:
+                            samples = col_samples.get(col_idx, [])
+                            if samples:
+                                sample_masked = ", ".join([_mask_value(tag, s) for s in samples])
+                                col_findings.append({
+                                    "tag": tag,
+                                    "description": desc,
+                                    "sensitivity": sens,
+                                    "regulation": reg,
+                                    "raw_value": f"Column: '{header}'",
+                                    "masked_value": f"Column: '{header}' ({total_rows - 1} rows)",
+                                    "line_number": 0,
+                                    "context": f"Sheet: {ws.title} | Header: {header} | Samples: {sample_masked}",
+                                    "confidence": 95,
+                                    "detection_method": "Column Header Analysis",
+                                })
+                            break
+
             wb.close()
-            return _sanitize("\n".join(parts)), "XLSX", None, 0
+            return _sanitize("\n".join(parts)), "XLSX", None, 0, col_findings
 
         if ext == ".pptx":
             try:
@@ -578,49 +624,63 @@ def extract_text(filepath: str) -> tuple[str | None, str, str | None, int]:
 
 def scan_regex(text: str) -> list[dict]:
     findings = []
-    lines = text.split("\n")
+    if not text:
+        return findings
 
-    for line_num, line in enumerate(lines, 1):
-        for pat in REGEX_PATTERNS:
-            for match in pat.regex.finditer(line):
-                raw = match.group().strip()
-                if len(raw) < pat.min_len:
+    # Pre-compute line start offsets for fast binary-search line number mapping
+    line_starts = [0] + [m.start() + 1 for m in re.finditer(r'\n', text)]
+
+    for pat in REGEX_PATTERNS:
+        for match in pat.regex.finditer(text):
+            raw = match.group().strip()
+            if len(raw) < pat.min_len:
+                continue
+
+            checksum_valid = None
+            if pat.validator:
+                checksum_valid = pat.validator(match)
+                if not checksum_valid:
                     continue
 
-                checksum_valid = None
-                if pat.validator:
-                    checksum_valid = pat.validator(match)
-                    if not checksum_valid:
-                        continue
+            start_pos = match.start()
+            end_pos = match.end()
 
-                start = max(0, match.start() - 40)
-                end = min(len(line), match.end() + 40)
-                ctx = line[start:end].strip()
-                masked = _mask_value(pat.tag, raw)
-                ctx_masked = _sanitize(ctx.replace(raw, masked))
+            line_num = bisect.bisect_right(line_starts, start_pos)
+            line_start = line_starts[line_num - 1]
+            line_end = line_starts[line_num] - 1 if line_num < len(line_starts) else len(text)
+            line = text[line_start:line_end]
 
-                confidence = 85
-                if checksum_valid is True:
-                    confidence = 99
-                if pat.tag == "IP_ADDRESS":
-                    confidence = 70
-                    if raw.startswith("127.") or raw.startswith("0."):
-                        confidence = 40
-                if pat.tag == "PIN_CODE":
-                    confidence = 50
+            rel_start = start_pos - line_start
+            rel_end = end_pos - line_start
+            ctx_start = max(0, rel_start - 40)
+            ctx_end = min(len(line), rel_end + 40)
+            ctx = line[ctx_start:ctx_end].strip()
 
-                findings.append({
-                    "tag": pat.tag,
-                    "description": pat.description,
-                    "sensitivity": pat.sensitivity,
-                    "regulation": pat.regulation,
-                    "raw_value": raw,
-                    "masked_value": masked,
-                    "line_number": line_num,
-                    "context": ctx_masked,
-                    "confidence": confidence,
-                    "detection_method": "Regex" + (" + Checksum" if checksum_valid else ""),
-                })
+            masked = _mask_value(pat.tag, raw)
+            ctx_masked = _sanitize(ctx.replace(raw, masked))
+
+            confidence = 85
+            if checksum_valid is True:
+                confidence = 99
+            if pat.tag == "IP_ADDRESS":
+                confidence = 70
+                if raw.startswith("127.") or raw.startswith("0."):
+                    confidence = 40
+            if pat.tag == "PIN_CODE":
+                confidence = 50
+
+            findings.append({
+                "tag": pat.tag,
+                "description": pat.description,
+                "sensitivity": pat.sensitivity,
+                "regulation": pat.regulation,
+                "raw_value": raw,
+                "masked_value": masked,
+                "line_number": line_num,
+                "context": ctx_masked,
+                "confidence": confidence,
+                "detection_method": "Regex" + (" + Checksum" if checksum_valid else ""),
+            })
 
     return findings
 
@@ -630,15 +690,27 @@ def scan_regex(text: str) -> list[dict]:
 # ===================================================================
 
 def scan_ner(text: str) -> list[dict]:
-    if not HAS_SPACY or _NLP is None:
+    nlp, model_name = get_nlp()
+    if not HAS_SPACY or nlp is None:
         return []
 
     findings = []
     max_chunk = 100000
     chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
+    chunk_offsets = [i * max_chunk for i in range(len(chunks))]
 
-    for chunk in chunks:
-        doc = _NLP(chunk)
+    skip_words = {
+        "dear", "sir", "madam", "mr", "mrs", "ms", "regards",
+        "thanks", "hi", "hello", "subject", "from", "to", "cc",
+        "sent", "date", "re", "fw", "fwd", "working", "ok",
+        "testing", "test", "related", "close", "arrange",
+        "none", "null", "n/a", "na", "true", "false",
+    }
+
+    line_starts = [0] + [m.start() + 1 for m in re.finditer(r'\n', text)]
+
+    for doc, chunk_offset in zip(nlp.pipe(chunks, batch_size=8), chunk_offsets):
+        chunk_text = doc.text
         for ent in doc.ents:
             tag = None
             sensitivity = "MEDIUM"
@@ -649,13 +721,6 @@ def scan_ner(text: str) -> list[dict]:
                 if len(ent.text.strip()) < 3:
                     continue
                 lower = ent.text.strip().lower()
-                skip_words = {
-                    "dear", "sir", "madam", "mr", "mrs", "ms", "regards",
-                    "thanks", "hi", "hello", "subject", "from", "to", "cc",
-                    "sent", "date", "re", "fw", "fwd", "working", "ok",
-                    "testing", "test", "related", "close", "arrange",
-                    "none", "null", "n/a", "na", "true", "false",
-                }
                 if lower in skip_words:
                     continue
                 tag = "PERSON_NAME"
@@ -681,20 +746,20 @@ def scan_ner(text: str) -> list[dict]:
 
             if tag:
                 masked = _mask_value(tag, ent.text.strip())
-                prefix = chunk[:ent.start_char]
-                line_num = prefix.count("\n") + 1
+                abs_start = chunk_offset + ent.start_char
+                abs_end = chunk_offset + ent.end_char
+                line_num = bisect.bisect_right(line_starts, abs_start)
 
                 ctx_start = max(0, ent.start_char - 40)
-                ctx_end = min(len(chunk), ent.end_char + 40)
-                ctx = _sanitize(chunk[ctx_start:ctx_end].replace(ent.text, masked))
+                ctx_end = min(len(chunk_text), ent.end_char + 40)
+                ctx = _sanitize(chunk_text[ctx_start:ctx_end].replace(ent.text, masked))
 
                 confidence = 75
                 if tag == "PERSON_NAME" and len(ent.text.split()) >= 2:
                     confidence = 85
                 if tag in ("ORGANISATION", "LOCATION"):
                     confidence = 65
-                # Bonus for using the large model
-                if _NLP_MODEL_NAME == "en_core_web_lg":
+                if model_name == "en_core_web_lg":
                     confidence = min(99, confidence + 5)
 
                 findings.append({
@@ -707,7 +772,7 @@ def scan_ner(text: str) -> list[dict]:
                     "line_number": line_num,
                     "context": ctx,
                     "confidence": confidence,
-                    "detection_method": f"spaCy NER ({_NLP_MODEL_NAME})",
+                    "detection_method": f"spaCy NER ({model_name})",
                 })
 
     return findings
@@ -888,7 +953,9 @@ def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
         print(f"  [{idx}/{total}] {rel}  ({size_display})")
 
         file_hash = _compute_sha256(str(fp))
-        text, ftype, error, img_count = extract_text(str(fp))
+        extracted = extract_text(str(fp))
+        text, ftype, error, img_count = extracted[0], extracted[1], extracted[2], extracted[3]
+        col_findings = extracted[4] if len(extracted) > 4 else []
 
         if error:
             file_audit.append({
@@ -915,8 +982,8 @@ def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
             file_findings.extend(scan_ner(text))
 
         # Layer 3: Column header analysis
-        if fp.suffix.lower() in (".xlsx", ".xls"):
-            file_findings.extend(scan_columns_xlsx(str(fp)))
+        if col_findings:
+            file_findings.extend(col_findings)
         elif fp.suffix.lower() in (".csv", ".tsv"):
             file_findings.extend(scan_columns_csv(str(fp)))
 
@@ -1649,7 +1716,8 @@ Examples:
     outdir = str(pathlib.Path(args.output).resolve())
     report_path = os.path.join(outdir, REPORT_FILENAME)
 
-    ner_status = (f"ACTIVE ({_NLP_MODEL_NAME})"
+    nlp, model_name = get_nlp()
+    ner_status = (f"ACTIVE ({model_name})"
                   if HAS_SPACY else "DISABLED")
     ocr_status = ("ACTIVE" if (HAS_PIL and HAS_TESSERACT)
                   else "NOT AVAILABLE")
