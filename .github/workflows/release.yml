@@ -1,0 +1,59 @@
+name: Build & Release PII Guardian Executable
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Package Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies & spaCy ML model
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m spacy download en_core_web_lg
+
+      - name: Build standalone executable with PyInstaller
+        run: |
+          python build_exe.py
+
+      - name: Package build artifact into ZIP archive
+        shell: powershell
+        run: |
+          Compress-Archive -Path "dist/PII_Guardian/*" -DestinationPath "PII_Guardian_Windows_x64.zip" -Force
+
+      - name: Create GitHub Release & Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PII_Guardian_Windows_x64.zip
+          name: PII Guardian ${{ github.ref_name }} Release
+          body: |
+            ## 🛡️ PII Guardian ${{ github.ref_name }} — Enterprise Release
+            
+            Multi-threaded 100% offline data discovery desktop application for Indian regulatory frameworks (DPDP Act 2023, DPDP Rules 2025, RBI, SEBI CSCRF, IRDAI, TRAI, CERT-In).
+            
+            ### Quick Start Instructions
+            1. Download **`PII_Guardian_Windows_x64.zip`** below.
+            2. Extract the ZIP archive.
+            3. Double-click **`PII_Guardian.exe`** inside the extracted folder.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
