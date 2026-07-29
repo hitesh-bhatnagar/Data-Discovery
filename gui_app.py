@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import queue
+import json
 import threading
 import subprocess
 import pathlib
@@ -20,6 +21,19 @@ import customtkinter as ctk
 
 # Import scanner core engine
 import pii_scanner_india as scanner
+
+# Import new modules
+try:
+    from report.heatmap_generator import generate_heatmap
+    HAS_HEATMAP = True
+except ImportError:
+    HAS_HEATMAP = False
+
+try:
+    from connectors.connector_registry import list_connector_types, connector_for_target
+    HAS_CONNECTORS = True
+except ImportError:
+    HAS_CONNECTORS = False
 
 # Configure CustomTkinter design system
 ctk.set_appearance_mode("Dark")
@@ -52,6 +66,8 @@ class PIIGuardianApp(ctk.CTk):
         self.all_findings = []
         self.all_file_audit = []
         self.latest_report_path = ""
+        self.latest_heatmap_path = ""
+        self._db_config = None
         self.MAX_UI_CARDS = 150
         self.displayed_finding_cards = 0
         self.show_cap_banner = False
@@ -366,6 +382,20 @@ class PIIGuardianApp(ctk.CTk):
         )
         self.btn_open_excel.pack(side="left", padx=(0, 10))
 
+        self.btn_open_heatmap = ctk.CTkButton(
+            action_bar,
+            text="🔥 Open Heatmap",
+            state="disabled",
+            fg_color="#F59E0B",
+            hover_color="#D97706",
+            text_color="#000000",
+            text_color_disabled="#475569",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=36,
+            command=self._open_heatmap
+        )
+        self.btn_open_heatmap.pack(side="left", padx=4)
+
         self.btn_open_folder = ctk.CTkButton(
             action_bar,
             text="📂 Open Output Directory",
@@ -376,6 +406,17 @@ class PIIGuardianApp(ctk.CTk):
             command=self._open_reports_folder
         )
         self.btn_open_folder.pack(side="left", padx=4)
+
+        self.btn_db_scan = ctk.CTkButton(
+            action_bar,
+            text="🗄️ DB Scan Config",
+            fg_color="#1E293B",
+            hover_color="#334155",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=36,
+            command=self._open_db_config
+        )
+        self.btn_db_scan.pack(side="right", padx=(4, 0))
 
     # ===================================================================
     # EVENT HANDLERS & DIALOGS
@@ -463,6 +504,7 @@ class PIIGuardianApp(ctk.CTk):
 
     def _run_scan_worker(self, target_path: str, output_dir: str):
         import concurrent.futures
+        import hashlib
 
         def log(msg):
             self.ui_queue.put(("LOG", msg))
@@ -531,12 +573,53 @@ class PIIGuardianApp(ctk.CTk):
                 self.ui_queue.put(("BATCH_FINDINGS", (file_findings, audit_record)))
 
         # Phase 2: Excel Report
+        saved_report = ""
         if all_findings or file_audit:
             log("\n[+] Generating Excel Audit Report...")
             report_file = os.path.join(output_dir, scanner.REPORT_FILENAME)
             saved_report = scanner.generate_report(all_findings, file_audit, report_file, target_path)
             log(f"[OK] Excel Report saved: {saved_report}")
             self.ui_queue.put(("REPORT_SAVED", saved_report))
+
+        # Phase 2b: Heatmap (Feature 9)
+        heatmap_file = None
+        if HAS_HEATMAP and all_findings:
+            log("\n[+] Generating Sensitivity Heatmap...")
+            try:
+                session_id = hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()
+                heatmap_file = generate_heatmap(all_findings, output_dir, session_id)
+                if heatmap_file:
+                    log(f"[OK] Heatmap saved: {heatmap_file}")
+                    self.ui_queue.put(("HEATMAP_SAVED", heatmap_file))
+            except Exception as e:
+                log(f"[-] Heatmap error: {e}")
+
+        # Phase 1b: Database Connector scan (Feature 1)
+        if HAS_CONNECTORS and hasattr(self, '_db_config') and self._db_config:
+            db_config = self._db_config
+            log(f"\n[+] Running database connector: {db_config.get('name', db_config.get('type', 'unknown'))}")
+            try:
+                resolved = connector_for_target(db_config)
+                if resolved:
+                    conn_cls, _ = resolved
+                    conn = conn_cls(db_config, scanner._ScannerHelper())
+                    conn_findings = conn.run()
+                    if conn_findings:
+                        all_findings.extend(conn_findings)
+                        log(f"[OK] {len(conn_findings)} PII finding(s) from database connector")
+                        for cf in conn_findings:
+                            self.ui_queue.put(("BATCH_FINDINGS", ([cf], {
+                                "file_name": cf.get("file_name", "db"),
+                                "status": "PII_DETECTED", "pii_count": 1,
+                                "file_type": "DATABASE", "file_size": 0,
+                                "last_modified": "", "sha256": "",
+                                "relative_path": cf.get("file_name", "db"),
+                                "risk_score": cf.get("sensitivity", "MEDIUM"),
+                                "pii_tags": cf.get("tag", "PII"),
+                                "embedded_images": 0,
+                            })))
+            except Exception as e:
+                log(f"[-] Connector error: {e}")
 
         self.ui_queue.put(("SCAN_COMPLETE", None))
 
@@ -595,6 +678,10 @@ class PIIGuardianApp(ctk.CTk):
                 elif msg_type == "REPORT_SAVED":
                     self.latest_report_path = payload
                     self.btn_open_excel.configure(state="normal", text_color="#000000")
+
+                elif msg_type == "HEATMAP_SAVED":
+                    self.latest_heatmap_path = payload
+                    self.btn_open_heatmap.configure(state="normal", text_color="#000000")
 
                 elif msg_type == "SCAN_COMPLETE":
                     self.is_scanning = False
@@ -807,6 +894,68 @@ class PIIGuardianApp(ctk.CTk):
             subprocess.run(["open", out_dir])
         else:
             subprocess.run(["xdg-open", out_dir])
+
+    def _open_heatmap(self):
+        if self.latest_heatmap_path and os.path.exists(self.latest_heatmap_path):
+            if sys.platform == "win32":
+                os.startfile(self.latest_heatmap_path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", self.latest_heatmap_path])
+            else:
+                subprocess.run(["xdg-open", self.latest_heatmap_path])
+
+    def _open_db_config(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Database Connection Config")
+        dialog.geometry("500x400")
+        dialog.configure(fg_color="#0B0F19")
+
+        ctk.CTkLabel(dialog, text="Database Connector Configuration",
+                     font=ctk.CTkFont(size=16, weight="bold"), text_color="#38BDF8").pack(pady=(12, 8))
+
+        frame = ctk.CTkFrame(dialog, fg_color="#111827", corner_radius=8)
+        frame.pack(fill="both", expand=True, padx=16, pady=4)
+
+        fields = [("Name", "name"), ("Type (database/mongodb/redis)", "type"),
+                  ("Driver (postgresql/mysql/mongodb/redis)", "driver"),
+                  ("Host", "host"), ("Port", "port"), ("Database", "database"),
+                  ("User", "user"), ("Password", "pass")]
+        entries = {}
+        for i, (label, key) in enumerate(fields):
+            ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(size=11), text_color="#E2E8F0").grid(
+                row=i, column=0, sticky="w", padx=12, pady=3)
+            e = ctk.CTkEntry(frame, font=ctk.CTkFont(size=11), fg_color="#1F2937",
+                             border_color="#374151", text_color="#F8FAFC", width=280)
+            e.grid(row=i, column=1, padx=8, pady=3, sticky="ew")
+            if key == "type":
+                e.insert(0, "database")
+            elif key == "driver":
+                e.insert(0, "postgresql")
+            elif key == "host":
+                e.insert(0, "localhost")
+            elif key == "port":
+                e.insert(0, "5432")
+            elif key == "name":
+                e.insert(0, "my-db-scan")
+            entries[key] = e
+
+        def save_config():
+            config = {}
+            for key, entry in entries.items():
+                val = entry.get().strip()
+                if key == "port" and val:
+                    val = int(val)
+                if val:
+                    config[key] = val
+            if config.get("driver") in ("mongodb", "redis"):
+                config["type"] = config.get("type") or config["driver"]
+            self._db_config = config
+            self.lbl_status.configure(text=f"✅ DB config saved: {config.get('name', config.get('type', 'unknown'))}")
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Save Config & Close", command=save_config,
+                      fg_color="#0284C7", hover_color="#0369A1",
+                      font=ctk.CTkFont(size=12, weight="bold")).pack(pady=10)
 
 if __name__ == "__main__":
     app = PIIGuardianApp()
