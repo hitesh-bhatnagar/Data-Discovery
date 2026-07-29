@@ -4,7 +4,7 @@ An enterprise-grade, **100% offline air-gapped**, multi-threaded Data Discovery 
 
 ---
 
-## ⚡ Key Performance Features (v3.0)
+## ⚡ Key Performance Features (v1.0)
 
 - **🚀 Multi-Threaded Parallel Scanning**: Automatically scales file parsing across multi-core CPUs for ultra-fast data discovery.
 - **🎨 Highly Responsive Executive GUI**: Built with CustomTkinter Dark Mode, featuring incremental card rendering and display capping to eliminate window freezing ("Not Responding") even when handling tens of thousands of PII findings.
@@ -25,7 +25,7 @@ An enterprise-grade, **100% offline air-gapped**, multi-threaded Data Discovery 
 No Python installation required! End users can download the pre-compiled standalone release:
 
 1. Go to the **[Releases](../../releases)** page on GitHub.
-2. Download **`PII_Guardian_v3.0.0_Windows_x64.zip`**.
+2. Download **`PII_Guardian_v1.0_Windows_x64.zip`**.
 3. Extract the ZIP archive to any folder.
 4. Double-click **`PII_Guardian.exe`** to launch the application.
 
