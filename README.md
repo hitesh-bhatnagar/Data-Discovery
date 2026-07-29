@@ -1,4 +1,4 @@
-# 🛡️ PII Guardian v3.0 — Enterprise Data Discovery & Compliance
+# 🛡️ PII Guardian v1.0 — Enterprise Data Discovery & Compliance
 
 An enterprise-grade, **100% offline air-gapped**, multi-threaded Data Discovery desktop application designed for Indian compliance frameworks (**DPDP Act 2023, DPDP Rules 2025, IT Act 2000, RBI Master Directions, SEBI CSCRF 2023, IRDAI, PFRDA, TRAI, CERT-In, Aadhaar Act 2016**).
 
