@@ -64,10 +64,23 @@ def get_nlp():
     if _SPACY_INITIALIZED:
         return _NLP, _NLP_MODEL_NAME
     _SPACY_INITIALIZED = True
+    disable_components = ["parser", "lemmatizer", "tagger", "attribute_ruler", "morphologizer", "senter"]
+
+    # Method 1: Direct model module load (Primary for PyInstaller standalone binaries & virtual environments)
+    import importlib
+    for _mod_name in ("en_core_web_lg", "en_core_web_sm"):
+        try:
+            mod = importlib.import_module(_mod_name)
+            _NLP = mod.load(disable=disable_components)
+            _NLP_MODEL_NAME = _mod_name
+            HAS_SPACY = True
+            return _NLP, _NLP_MODEL_NAME
+        except Exception:
+            continue
+
+    # Method 2: Fallback spacy.load() string lookup
     try:
         import spacy
-        # Disable all unneeded components to reduce RAM footprint by ~60% and speed up processing
-        disable_components = ["parser", "lemmatizer", "tagger", "attribute_ruler", "morphologizer", "senter"]
         for _model_name in ("en_core_web_lg", "en_core_web_sm"):
             try:
                 _NLP = spacy.load(_model_name, disable=disable_components)
@@ -911,6 +924,109 @@ def deduplicate_findings(findings: list[dict]) -> list[dict]:
 #  FILE SCANNER — ORCHESTRATOR
 # ===================================================================
 
+def scan_single_file(fp: pathlib.Path, target: pathlib.Path) -> tuple[list[dict], dict]:
+    """Scans a single file using all detection layers. Returns (file_findings, audit_record)."""
+    rel = str(fp.relative_to(target)) if fp.is_relative_to(target) else str(fp)
+    try:
+        stat = fp.stat()
+        fsize = stat.st_size
+        fmod = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        fsize = 0
+        fmod = "N/A"
+
+    file_hash = _compute_sha256(str(fp))
+    extracted = extract_text(str(fp))
+    text, ftype, error, img_count = extracted[0], extracted[1], extracted[2], extracted[3]
+    col_findings = extracted[4] if len(extracted) > 4 else []
+
+    if error:
+        audit_record = {
+            "file_name": fp.name, "file_path": str(fp),
+            "relative_path": rel, "file_type": ftype,
+            "file_size": fsize, "last_modified": fmod,
+            "sha256": file_hash, "status": "SKIPPED",
+            "reason": error, "pii_tags": "", "pii_count": 0,
+            "risk_score": "N/A", "embedded_images": img_count,
+        }
+        return [], audit_record
+
+    # ------ Detection Pipeline ------
+    file_findings = []
+
+    # Layer 1: Regex
+    if text:
+        file_findings.extend(scan_regex(text))
+
+    # Layer 2: spaCy NER (only for unstructured text)
+    is_sheet = fp.suffix.lower() in (".xlsx", ".xls", ".csv", ".tsv")
+    if text and not is_sheet:
+        file_findings.extend(scan_ner(text))
+
+    # Layer 3: Column header analysis
+    if col_findings:
+        file_findings.extend(col_findings)
+    elif fp.suffix.lower() in (".csv", ".tsv"):
+        file_findings.extend(scan_columns_csv(str(fp)))
+
+    # Embedded images flag
+    if img_count > 0:
+        file_findings.append({
+            "tag": "EMBEDDED_IMAGES",
+            "description": (f"{img_count} embedded image(s) — may contain "
+                            "PII (screenshots, IDs, scanned documents)"),
+            "sensitivity": "MEDIUM",
+            "regulation": "DPDP Act 2023, IT Rules 2011, DPDP Rules 2025",
+            "raw_value": f"{img_count} image(s)",
+            "masked_value": f"{img_count} embedded image(s)",
+            "line_number": 0,
+            "context": (f"File contains {img_count} embedded image(s). "
+                        "Manual review recommended."),
+            "confidence": 60,
+            "detection_method": "File Structure Analysis",
+        })
+
+    # Deduplicate
+    file_findings = deduplicate_findings(file_findings)
+    pii_count = len(file_findings)
+
+    # Attach file metadata
+    for f in file_findings:
+        f["file_name"] = fp.name
+        f["file_path"] = str(fp)
+        f["relative_path"] = rel
+        f["file_type"] = ftype
+        f["file_size"] = fsize
+        f["last_modified"] = fmod
+        f["sha256"] = file_hash
+
+    if pii_count == 0:
+        risk_score = "CLEAN"
+    elif any(f["sensitivity"] == "HIGH" for f in file_findings):
+        risk_score = "HIGH"
+    elif any(f["sensitivity"] == "MEDIUM" for f in file_findings):
+        risk_score = "MEDIUM"
+    else:
+        risk_score = "LOW"
+
+    tags_found = sorted(set(f["tag"] for f in file_findings))
+    status = "PII_DETECTED" if pii_count > 0 else "CLEAN"
+
+    audit_record = {
+        "file_name": fp.name, "file_path": str(fp),
+        "relative_path": rel, "file_type": ftype,
+        "file_size": fsize, "last_modified": fmod,
+        "sha256": file_hash, "status": status,
+        "reason": (f"{pii_count} finding(s)" if pii_count > 0
+                   else "No PII detected"),
+        "pii_tags": ", ".join(tags_found),
+        "pii_count": pii_count, "risk_score": risk_score,
+        "embedded_images": img_count,
+    }
+
+    return file_findings, audit_record
+
+
 def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
     all_findings: list[dict] = []
     file_audit: list[dict] = []
@@ -938,118 +1054,25 @@ def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
     print()
 
     for idx, fp in enumerate(files_to_scan, 1):
-        rel = str(fp.relative_to(target)) if fp.is_relative_to(target) else str(fp)
-        try:
-            stat = fp.stat()
-            fsize = stat.st_size
-            fmod = datetime.datetime.fromtimestamp(
-                stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            fsize = 0
-            fmod = "N/A"
-
-        size_display = (f"{fsize / 1024:.1f} KB" if fsize < 1048576
-                        else f"{fsize / 1048576:.1f} MB")
-        print(f"  [{idx}/{total}] {rel}  ({size_display})")
-
-        file_hash = _compute_sha256(str(fp))
-        extracted = extract_text(str(fp))
-        text, ftype, error, img_count = extracted[0], extracted[1], extracted[2], extracted[3]
-        col_findings = extracted[4] if len(extracted) > 4 else []
-
-        if error:
-            file_audit.append({
-                "file_name": fp.name, "file_path": str(fp),
-                "relative_path": rel, "file_type": ftype,
-                "file_size": fsize, "last_modified": fmod,
-                "sha256": file_hash, "status": "SKIPPED",
-                "reason": error, "pii_tags": "", "pii_count": 0,
-                "risk_score": "N/A", "embedded_images": img_count,
-            })
-            print(f"           [SKIP] {error}")
-            continue
-
-        # ------ Detection Pipeline ------
-        file_findings = []
-
-        # Layer 1: Regex
-        if text:
-            file_findings.extend(scan_regex(text))
-
-        # Layer 2: spaCy NER (only for unstructured text)
-        is_sheet = fp.suffix.lower() in (".xlsx", ".xls", ".csv", ".tsv")
-        if text and not is_sheet:
-            file_findings.extend(scan_ner(text))
-
-        # Layer 3: Column header analysis
-        if col_findings:
-            file_findings.extend(col_findings)
-        elif fp.suffix.lower() in (".csv", ".tsv"):
-            file_findings.extend(scan_columns_csv(str(fp)))
-
-        # Embedded images flag
-        if img_count > 0:
-            file_findings.append({
-                "tag": "EMBEDDED_IMAGES",
-                "description": (f"{img_count} embedded image(s) — may contain "
-                                "PII (screenshots, IDs, scanned documents)"),
-                "sensitivity": "MEDIUM",
-                "regulation": "DPDP Act 2023, IT Rules 2011, DPDP Rules 2025",
-                "raw_value": f"{img_count} image(s)",
-                "masked_value": f"{img_count} embedded image(s)",
-                "line_number": 0,
-                "context": (f"File contains {img_count} embedded image(s). "
-                            "Manual review recommended."),
-                "confidence": 60,
-                "detection_method": "File Structure Analysis",
-            })
-
-        # Deduplicate
-        file_findings = deduplicate_findings(file_findings)
-        pii_count = len(file_findings)
-
-        # Attach file metadata
-        for f in file_findings:
-            f["file_name"] = fp.name
-            f["file_path"] = str(fp)
-            f["relative_path"] = rel
-            f["file_type"] = ftype
-            f["file_size"] = fsize
-            f["last_modified"] = fmod
-            f["sha256"] = file_hash
-
+        file_findings, audit_record = scan_single_file(fp, target)
         all_findings.extend(file_findings)
+        file_audit.append(audit_record)
 
-        if pii_count == 0:
-            risk_score = "CLEAN"
-        elif any(f["sensitivity"] == "HIGH" for f in file_findings):
-            risk_score = "HIGH"
-        elif any(f["sensitivity"] == "MEDIUM" for f in file_findings):
-            risk_score = "MEDIUM"
-        else:
-            risk_score = "LOW"
+        rel = audit_record["relative_path"]
+        pii_count = audit_record["pii_count"]
+        tags_found = audit_record["pii_tags"]
+        img_count = audit_record["embedded_images"]
+        status = audit_record["status"]
 
-        tags_found = sorted(set(f["tag"] for f in file_findings))
-        status = "PII_DETECTED" if pii_count > 0 else "CLEAN"
-
-        file_audit.append({
-            "file_name": fp.name, "file_path": str(fp),
-            "relative_path": rel, "file_type": ftype,
-            "file_size": fsize, "last_modified": fmod,
-            "sha256": file_hash, "status": status,
-            "reason": (f"{pii_count} finding(s)" if pii_count > 0
-                       else "No PII detected"),
-            "pii_tags": ", ".join(tags_found),
-            "pii_count": pii_count, "risk_score": risk_score,
-            "embedded_images": img_count,
-        })
-
-        if pii_count > 0:
+        if status == "SKIPPED":
+            print(f"  [{idx}/{total}] [SKIP] {rel} — {audit_record['reason']}")
+        elif pii_count > 0:
             img_note = f" | Images: {img_count}" if img_count > 0 else ""
-            print(f"           [!] PII DETECTED: {pii_count} finding(s) | "
-                  f"Tags: {', '.join(tags_found)}{img_note}")
+            print(f"  [{idx}/{total}] [!] PII DETECTED: {rel} ({pii_count} findings) | Tags: {tags_found}{img_note}")
         else:
-            print("           [OK] Clean")
+            print(f"  [{idx}/{total}] [OK] Clean: {rel}")
+
+    return all_findings, file_audit
 
     return all_findings, file_audit
 

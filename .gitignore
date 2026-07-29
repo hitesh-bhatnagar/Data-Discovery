@@ -10,6 +10,11 @@ __pycache__/
 *$py.class
 *.so
 
+# PyInstaller Build Artefacts
+dist/
+build/
+*.spec
+
 # IDE configuration (keep team settings, ignore local state)
 .vscode/*
 !.vscode/settings.json

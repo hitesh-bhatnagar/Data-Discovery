@@ -1,6 +1,34 @@
-# PII Data Discovery Tool v3.0 (India Regulatory Focus)
+# PII Guardian v3.0 (India Regulatory Focus)
 
-An enterprise-grade, **100% offline**, ML-enhanced Data Discovery tool designed for Indian compliance frameworks (DPDP Act 2023, DPDP Rules 2025, IT Act, RBI, SEBI, IRDAI, etc.).
+An enterprise-grade, **100% offline**, ML-enhanced Data Discovery desktop application designed for Indian compliance frameworks (DPDP Act 2023, DPDP Rules 2025, IT Act, RBI, SEBI, IRDAI, etc.).
+
+---
+
+## 🖥️ Desktop Application GUI & Standalone Executable
+
+PII Guardian includes a modern Dark-Mode Desktop Application GUI with live risk dashboards, real-time counters, interactive findings tables, and 1-click Excel audit report launchers.
+
+### Option A: Launch Desktop Application GUI
+```powershell
+# Launch Desktop GUI Application
+.\run_app.ps1
+```
+
+### Option B: Standalone Executable (.exe)
+Build and run the compiled Windows standalone binary without Python installed:
+```powershell
+# Build standalone executable (saved under dist/PII_Guardian/PII_Guardian.exe)
+python build_exe.py
+```
+
+### Option C: Command Line Scanner
+```powershell
+# Run CLI scan on default test folder
+.\run_scanner.ps1
+
+# Run CLI scan on a custom target directory
+.\run_scanner.ps1 -TargetPath "C:\path\to\your\documents"
+```
 
 ---
 
@@ -21,40 +49,22 @@ Before cloning and running this tool, team members need:
 
 ## 🚀 Quick Start for Team Members
 
-### Step 1: Clone the Repository
 ```powershell
+# 1. Clone the repository
 git clone <REPOSITORY_URL>
 cd Data_discovery
-```
 
-### Step 2: Set up Virtual Environment & Run Setup Script
-Open PowerShell in the project directory and run:
-
-```powershell
-# 1. Create Python virtual environment
+# 2. Create Python virtual environment
 python -m venv .venv312
 
-# 2. Run automated setup script (installs requirements & spaCy NER model)
+# 3. Run automated setup script
 .\setup.ps1
+
+# 4. Launch Desktop GUI App
+.\run_app.ps1
 ```
 
 > **Note**: `setup.ps1` downloads the Python packages listed in `requirements.txt` and the `en_core_web_lg` spaCy model (~400 MB). **After setup completes, the tool runs 100% offline.**
-
----
-
-## 🏃 Running the PII Scanner
-
-Run scans using the included PowerShell runner:
-
-```powershell
-# Run scan on default test folder
-.\run_scanner.ps1
-
-# Run scan on a custom target directory
-.\run_scanner.ps1 -TargetPath "C:\path\to\your\documents"
-```
-
-The scan report will be generated as an Excel file under `reports/PII_Discovery_Report.xlsx`.
 
 ---
 
@@ -62,13 +72,15 @@ The scan report will be generated as an Excel file under `reports/PII_Discovery_
 
 ```
 Data_discovery/
+├── gui_app.py             # Desktop GUI Application (CustomTkinter)
 ├── pii_scanner_india.py   # Core PII discovery engine & rules
+├── build_exe.py           # PyInstaller build script for standalone .exe
+├── run_app.ps1            # GUI App runner script
+├── run_scanner.ps1        # CLI wrapper script
 ├── setup.ps1              # Automated setup script for team members
-├── run_scanner.ps1        # Execution wrapper script
 ├── requirements.txt       # Python dependencies
 ├── pyrightconfig.json     # IDE type checker configuration
 ├── DOCUMENTATION.md       # Technical architecture & legal framework details
-├── .vscode/               # Editor environment settings
 ├── test/                  # Sample test documents
 └── reports/               # Output directory for audit reports (git-ignored)
 ```
