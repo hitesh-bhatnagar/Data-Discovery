@@ -1,4 +1,4 @@
-# PII Guardian v3.0 (India Regulatory Focus)
+# PII Guardian v1.0 (India Regulatory Focus)
 
 An enterprise-grade, **100% offline**, ML-enhanced Data Discovery desktop application designed for Indian compliance frameworks (DPDP Act 2023, DPDP Rules 2025, IT Act, RBI, SEBI, IRDAI, etc.).
 
