@@ -44,7 +44,32 @@ import argparse
 import datetime
 import pathlib
 import zipfile
+import json
 from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# New modules: connectors, ML classifier, archive scan, stego hints, heatmap
+# ---------------------------------------------------------------------------
+from connectors.connector_registry import connector_for_target, list_connector_types
+from connectors.archive_scan import scan_archive
+from connectors.stego_hint import build_stego_hint
+try:
+    from utils.ml_classifier import classify as ml_classify
+    HAS_ML = True
+except ImportError:
+    HAS_ML = False
+
+try:
+    from utils.content_type import choose_effective_extension, sniff_extension
+    HAS_CTYPE = True
+except ImportError:
+    HAS_CTYPE = False
+
+try:
+    from report.heatmap_generator import generate_heatmap
+    HAS_HEATMAP = True
+except ImportError:
+    HAS_HEATMAP = False
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -516,7 +541,17 @@ def _ocr_image(filepath: str) -> str | None:
 
 def extract_text(filepath: str) -> tuple[str | None, str, str | None, int]:
     """Returns (text, file_type, error, embedded_image_count)."""
-    ext = pathlib.Path(filepath).suffix.lower()
+    fp_path = pathlib.Path(filepath)
+    orig_ext = fp_path.suffix.lower()
+
+    # Feature 7: Content-type verification via magic bytes
+    if HAS_CTYPE:
+        effective_ext = choose_effective_extension(fp_path, orig_ext)
+        if effective_ext != orig_ext:
+            pass  # use effective_ext for detection; still report original type
+        ext = effective_ext
+    else:
+        ext = orig_ext
     img_count = 0
 
     try:
@@ -792,6 +827,77 @@ def scan_ner(text: str) -> list[dict]:
 
 
 # ===================================================================
+#  LAYER 2b — ML CLASSIFICATION (Feature 6)
+# ===================================================================
+
+def scan_ml(text: str) -> list[dict]:
+    if not HAS_ML or not text:
+        return []
+    tag, confidence = ml_classify(text)
+    if tag == "CLEAN" or confidence < 50:
+        return []
+    sens_map = {
+        "AADHAAR": "HIGH", "PAN_CARD": "HIGH", "PASSPORT_IN": "HIGH",
+        "VOTER_ID": "HIGH", "DRIVING_LICENSE": "HIGH", "CREDIT_CARD": "HIGH",
+        "PHONE_IN": "HIGH", "EMAIL": "HIGH", "FINANCIAL": "HIGH",
+        "BANK_ACCOUNT": "HIGH", "DATE_OF_BIRTH": "HIGH", "PERSON_NAME": "HIGH",
+        "HEALTH_DATA": "HIGH", "BIOMETRIC": "HIGH", "PASSWORD": "HIGH",
+        "GSTIN": "MEDIUM", "IFSC_CODE": "MEDIUM", "UPI_ID": "MEDIUM",
+        "ADDRESS": "MEDIUM", "IP_ADDRESS": "LOW", "PIN_CODE": "LOW",
+    }
+    sensitivity = sens_map.get(tag, "MEDIUM")
+    reg_map = {
+        "AADHAAR": "DPDP Act 2023, Aadhaar Act 2016",
+        "PAN_CARD": "DPDP Act 2023, Income Tax Act",
+        "PASSPORT_IN": "DPDP Act 2023, Passports Act 1967",
+        "CREDIT_CARD": "PCI-DSS v4.0, RBI Card-on-File Dir.",
+        "PHONE_IN": "DPDP Act 2023, TRAI Regulations",
+        "BANK_ACCOUNT": "RBI Master Directions, DPDP Act 2023",
+        "PASSWORD": "DPDP Act 2023, IT Act 2000",
+    }
+    regulation = reg_map.get(tag, "DPDP Act 2023")
+    return [{
+        "tag": tag,
+        "description": f"ML Classified: {tag}",
+        "sensitivity": sensitivity,
+        "regulation": regulation,
+        "raw_value": text[:100],
+        "masked_value": text[:50] + "...",
+        "line_number": 0,
+        "context": f"ML confidence: {confidence:.1f}%",
+        "confidence": int(confidence),
+        "detection_method": "ML Classifier (TF-IDF + RandomForest)",
+    }]
+
+
+# ===================================================================
+#  COLUMN TEXT SCANNER (for connector integration)
+# ===================================================================
+
+def scan_column_text(column_name: str, sample_text: str) -> dict | None:
+    combined = f"{column_name} {sample_text}"
+    findings = scan_regex(combined)
+    if findings:
+        f = findings[0]
+        return {"pattern_detected": f["tag"], "sensitivity_level": f["sensitivity"],
+                "confidence": f["confidence"], "regulation": f.get("regulation", "DPDP Act 2023")}
+    if HAS_ML:
+        tag, conf = ml_classify(combined)
+        if tag != "CLEAN" and conf >= 50:
+            sens_map = {"AADHAAR": "HIGH", "PAN_CARD": "HIGH", "PASSPORT_IN": "HIGH",
+                        "CREDIT_CARD": "HIGH", "PHONE_IN": "HIGH", "EMAIL": "HIGH",
+                        "FINANCIAL": "HIGH", "BANK_ACCOUNT": "HIGH", "DATE_OF_BIRTH": "HIGH",
+                        "PERSON_NAME": "HIGH", "PASSWORD": "HIGH"}
+            return {"pattern_detected": tag, "sensitivity_level": sens_map.get(tag, "MEDIUM"),
+                    "confidence": int(conf), "regulation": "DPDP Act 2023"}
+    return None
+
+
+def extract_text_wrapper(filepath: str) -> tuple[str | None, str, str | None, int]:
+    return extract_text(str(filepath))[:4]
+
+
+# ===================================================================
 #  LAYER 3 — COLUMN HEADER ANALYSIS
 # ===================================================================
 
@@ -969,6 +1075,30 @@ def scan_single_file(fp: pathlib.Path, target: pathlib.Path) -> tuple[list[dict]
     elif fp.suffix.lower() in (".csv", ".tsv"):
         file_findings.extend(scan_columns_csv(str(fp)))
 
+    # Layer 4: ML Classification (Feature 6)
+    if text:
+        ml_findings = scan_ml(text)
+        for mf in ml_findings:
+            overlap = any(f["tag"] == mf["tag"] for f in file_findings)
+            if not overlap:
+                file_findings.extend(ml_findings)
+
+    # Layer 5: Steganography hint (Feature 11)
+    stego_hint = build_stego_hint(fp)
+    if stego_hint:
+        file_findings.append({
+            "tag": "STEGO_HINT",
+            "description": "Possible steganography container",
+            "sensitivity": "LOW",
+            "regulation": "DPDP Act 2023, IT Act 2000",
+            "raw_value": stego_hint,
+            "masked_value": stego_hint,
+            "line_number": 0,
+            "context": f"File: {fp.name} | {stego_hint}",
+            "confidence": 40,
+            "detection_method": "Stego Entropy Analysis",
+        })
+
     # Embedded images flag
     if img_count > 0:
         file_findings.append({
@@ -1027,6 +1157,19 @@ def scan_single_file(fp: pathlib.Path, target: pathlib.Path) -> tuple[list[dict]
     return file_findings, audit_record
 
 
+class _ScannerHelper:
+    """Provides scan_text and extract_text_wrapper for archive/module integrations."""
+    def scan_text(self, text: str) -> list[dict]:
+        f = scan_regex(text)
+        if HAS_ML:
+            f.extend(scan_ml(text))
+        return deduplicate_findings(f)
+    def extract_text_wrapper(self, filepath: str) -> tuple[str | None, str, str | None, int]:
+        return extract_text(filepath)[:4]
+    def scan_column_text(self, name: str, text: str) -> dict | None:
+        return scan_column_text(name, text)
+
+
 def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
     all_findings: list[dict] = []
     file_audit: list[dict] = []
@@ -1046,14 +1189,55 @@ def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
                 if fn.startswith("~$"):
                     continue
                 fp = pathlib.Path(root) / fn
-                if fp.suffix.lower() in SCAN_EXTENSIONS:
+                ext = fp.suffix.lower()
+                if ext in SCAN_EXTENSIONS:
                     files_to_scan.append(fp)
+
+    # Feature 8: Archive scanning — add archives as scan targets
+    archive_files = []
+    for root, dirs, filenames in os.walk(target):
+        for fn in filenames:
+            fp = pathlib.Path(root) / fn
+            if fp.suffix.lower() in (".zip", ".tar", ".gz", ".tar.gz", ".tgz", ".7z"):
+                archive_files.append(fp)
+    files_to_scan.extend(archive_files)
 
     total = len(files_to_scan)
     print(f"  [+] {total} file(s) to scan in: {target}")
     print()
 
     for idx, fp in enumerate(files_to_scan, 1):
+        is_archive = fp.suffix.lower() in (".zip", ".tar", ".gz", ".tar.gz", ".tgz", ".7z")
+
+        if is_archive:
+            arc_findings = scan_archive(fp, _ScannerHelper(), on_error=lambda m: print(f"    [WARN] {m}"))
+            if arc_findings:
+                all_findings.extend(arc_findings)
+                audit_record = {
+                    "file_name": fp.name, "file_path": str(fp),
+                    "relative_path": str(fp.relative_to(target)) if fp.is_relative_to(target) else str(fp),
+                    "file_type": fp.suffix[1:].upper(), "file_size": 0,
+                    "last_modified": "", "sha256": "", "status": "PII_DETECTED",
+                    "reason": f"{len(arc_findings)} finding(s)",
+                    "pii_tags": ", ".join(sorted(set(f.get("tag", "") for f in arc_findings))),
+                    "pii_count": len(arc_findings),
+                    "risk_score": "HIGH" if any(f.get("sensitivity") == "HIGH" for f in arc_findings) else "MEDIUM",
+                    "embedded_images": 0,
+                }
+                file_audit.append(audit_record)
+                print(f"  [{idx}/{total}] [!] ARCHIVE PII: {fp.name} ({len(arc_findings)} findings)")
+            else:
+                file_audit.append({
+                    "file_name": fp.name, "file_path": str(fp),
+                    "relative_path": str(fp.relative_to(target)) if fp.is_relative_to(target) else str(fp),
+                    "file_type": fp.suffix[1:].upper(), "file_size": 0,
+                    "last_modified": "", "sha256": "", "status": "CLEAN",
+                    "reason": "No PII in archive contents", "pii_tags": "",
+                    "pii_count": 0, "risk_score": "CLEAN", "embedded_images": 0,
+                })
+                print(f"  [{idx}/{total}] [OK] Archive clean: {fp.name}")
+            continue
+
         file_findings, audit_record = scan_single_file(fp, target)
         all_findings.extend(file_findings)
         file_audit.append(audit_record)
@@ -1071,8 +1255,6 @@ def scan_folder(target_path: str) -> tuple[list[dict], list[dict]]:
             print(f"  [{idx}/{total}] [!] PII DETECTED: {rel} ({pii_count} findings) | Tags: {tags_found}{img_note}")
         else:
             print(f"  [{idx}/{total}] [OK] Clean: {rel}")
-
-    return all_findings, file_audit
 
     return all_findings, file_audit
 
@@ -1733,6 +1915,13 @@ Examples:
     parser.add_argument("--output", "-o", type=str,
                         default=str(DEFAULT_REPORTS_DIR),
                         help="Output directory for reports (default: ./reports)")
+    parser.add_argument("--db-target", type=str, default=None,
+                        help="JSON database target config for connector scanning. "
+                             'Example: \'{"type":"database","driver":"postgresql","host":"localhost","database":"mydb","user":"u","pass":"p"}\'')
+    parser.add_argument("--connector", type=str, default=None,
+                        help="Named connector type to use with --db-target")
+    parser.add_argument("--no-heatmap", action="store_true",
+                        help="Skip heatmap generation")
     args = parser.parse_args()
 
     target = str(pathlib.Path(args.target).resolve())
@@ -1761,19 +1950,52 @@ Examples:
     print("=" * 65)
     print()
 
-    # Phase 1 — Scan
+    # Phase 1a — File Scan
     print("[PHASE 1] Scanning files...")
     print()
     start_time = datetime.datetime.now()
     findings, file_audit = scan_folder(target)
     scan_duration = (datetime.datetime.now() - start_time).total_seconds()
 
+    # Phase 1b — Database Connector Scan (Feature 1)
+    connector_findings = []
+    if args.db_target:
+        try:
+            db_config = json.loads(args.db_target) if isinstance(args.db_target, str) else args.db_target
+            resolved = connector_for_target(db_config)
+            if resolved:
+                conn_cls, req_keys = resolved
+                scanner_helper = _ScannerHelper()
+                conn = conn_cls(db_config, scanner_helper)
+                print(f"\n[PHASE 1b] Scanning database connector: {db_config.get('name', db_config.get('type', 'unknown'))}")
+                connector_findings = conn.run()
+                if connector_findings:
+                    findings.extend(connector_findings)
+                    print(f"  [+] {len(connector_findings)} PII finding(s) from database connector")
+            else:
+                print(f"  [-] No connector found for target: {db_config}")
+        except Exception as e:
+            print(f"  [-] Connector error: {e}")
+
     # Phase 2 — Report
     print()
     print("[PHASE 2] Generating Report...")
-    generate_report(findings, file_audit, report_path, target)
+    report_path_actual = generate_report(findings, file_audit, report_path, target)
+
+    # Phase 2b — Heatmap (Feature 9)
+    heatmap_path = None
+    if HAS_HEATMAP and not args.no_heatmap and findings:
+        print("[PHASE 2b] Generating Heatmap...")
+        try:
+            session_id = hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()
+            heatmap_path = generate_heatmap(findings, outdir, session_id)
+            if heatmap_path:
+                print(f"  [OK] Heatmap saved: {heatmap_path}")
+        except Exception as e:
+            print(f"  [-] Heatmap generation failed: {e}")
 
     # Summary
+    connector_count = len(connector_findings)
     high_c = sum(1 for f in findings if f["sensitivity"] == "HIGH")
     med_c = sum(1 for f in findings if f["sensitivity"] == "MEDIUM")
     low_c = sum(1 for f in findings if f["sensitivity"] == "LOW")
@@ -1786,11 +2008,14 @@ Examples:
     print(f"  Files Scanned:      {len(file_audit)}")
     print(f"  Files with PII:     "
           f"{sum(1 for f in file_audit if f['status'] == 'PII_DETECTED')}")
+    print(f"  DB Connector Finds: {connector_count}")
     print(f"  Total Findings:     {len(findings)}")
     print(f"    HIGH Risk:        {high_c}")
     print(f"    MEDIUM Risk:      {med_c}")
     print(f"    LOW Risk:         {low_c}")
     print(f"  Report:             {report_path}")
+    if heatmap_path:
+        print(f"  Heatmap:            {heatmap_path}")
     print("=" * 65)
     print()
 
